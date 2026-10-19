@@ -490,7 +490,7 @@ function saveLocal(){
   try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){toast('Kaydedilemedi')}
   bc&&bc.postMessage('sync');
 }
-function save(){state._t=Date.now();saveLocal();cloudPush()}
+function save(){saveLocal();cloudPush()}
 bc&&(bc.onmessage=()=>{state=load();render()});
 window.addEventListener('storage',e=>{if(e.key===KEY){state=load();render()}});
 
@@ -783,9 +783,15 @@ function syncNav(){document.querySelectorAll('#bnav>button:not(.plus)').forEach(
   addEventListener('popstate',()=>{if(popSkip>0){popSkip--;return}const o=[...document.querySelectorAll('.ov.show')].pop();if(o){closeM(o.id,true)}else if(document.getElementById('side').classList.contains('open'))toggleSide(false)});
 })();
 
-/* ========= BULUT SENKRON (Firebase Realtime Database REST) ========= */
-const SKEY=KEY+'_sync';
-let cloud=null,es=null,pushT=null,pending=false,onFirst=null,firstEv=true;
+/* ========= BULUT SENKRON (Firebase Realtime Database REST) =========
+   Sıralama cihaz saatine değil Firebase sunucu saatine göre yapılır.
+   Kural: gönderilmemiş yerel değişiklik yoksa buluttaki her zaman kazanır. */
+const SKEY=KEY+'_sync',DKEY=KEY+'_dirty',TKEY=KEY+'_synct';
+let cloud=null,es=null,pushT=null,pollT=null,onFirst=null,editSeq=0,pushing=false;
+let pending=(()=>{try{return localStorage.getItem(DKEY)==='1'}catch(e){return false}})();
+let lastT=(()=>{try{return Number(localStorage.getItem(TKEY))||null}catch(e){return null}})();
+function setPending(v){pending=v;try{v?localStorage.setItem(DKEY,'1'):localStorage.removeItem(DKEY)}catch(e){}}
+function setLastT(t){lastT=(typeof t==='number')?t:null;try{lastT?localStorage.setItem(TKEY,String(lastT)):localStorage.removeItem(TKEY)}catch(e){}}
 function cloudCfg(){try{const c=JSON.parse(localStorage.getItem(SKEY));return c&&c.url&&c.code?c:null}catch(e){return null}}
 function cloudUrl(c){return c.url+'/paneller/'+c.code+'.json'}
 function linkOf(c){return c.url+'#'+c.code}
@@ -796,81 +802,102 @@ function setCS(st){
   const box=document.getElementById('syncSt');
   if(box)box.innerHTML=`<i class="cdot" style="position:static;box-shadow:none"></i><span><b>${t}</b>${st==='on'?(pending?' · gönderiliyor…':' · tüm değişiklikler kayıtlı'):st==='err'?' · internet ya da Firebase ayarını kontrol et':st==='off'?' · veriler sadece bu cihazda':''}</span>`;
 }
-function cloudPush(){if(!cloud)return;pending=true;clearTimeout(pushT);pushT=setTimeout(doPush,500)}
+function bodyOf(){return JSON.stringify({t:{'.sv':'timestamp'},d:JSON.stringify(state)})}
+function cloudPush(){if(!cloud)return;editSeq++;setPending(true);clearTimeout(pushT);pushT=setTimeout(doPush,400)}
 async function doPush(){
   if(!cloud||!pending)return;
-  const body=JSON.stringify({t:state._t||Date.now(),d:JSON.stringify(state)});
-  try{const r=await fetch(cloudUrl(cloud),{method:'PUT',body});if(!r.ok)throw new Error(r.status);pending=false;setCS('on')}
-  catch(e){setCS('err')}
+  if(pushing){clearTimeout(pushT);pushT=setTimeout(doPush,300);return}
+  pushing=true;const seq=editSeq;
+  try{
+    const r=await fetch(cloudUrl(cloud),{method:'PUT',body:bodyOf()});
+    if(!r.ok)throw new Error(r.status);
+    let j=null;try{j=await r.json()}catch(e){}
+    setLastT(j&&typeof j.t==='number'?j.t:null);
+    if(seq===editSeq)setPending(false);else{clearTimeout(pushT);pushT=setTimeout(doPush,300)}
+    setCS('on');
+  }catch(e){setCS('err')}
+  finally{pushing=false}
 }
-function applyRemote(data,force){
-  if(!data||!data.d)return;
-  if(!force&&(data.t||0)<=(state._t||0))return;
-  let d;try{d=JSON.parse(data.d)}catch(e){return}
-  if(!d||!Array.isArray(d.businesses))return;
+function applyRemote(data){
+  if(!data||!data.d)return false;
+  let d;try{d=JSON.parse(data.d)}catch(e){return false}
+  if(!d||!Array.isArray(d.businesses))return false;
   const act=state.active;
-  d.events=d.events||{};d.notes=d.notes||{};d._t=data.t||Date.now();
+  d.events=d.events||{};d.notes=d.notes||{};delete d._t;
   state=d;
   if(act&&state.businesses.some(b=>b.id===act))state.active=act;
-  saveLocal();render();
+  else if(!state.businesses.some(b=>b.id===state.active))state.active=state.businesses[0]?.id||null;
+  setLastT(data.t);saveLocal();render();
+  return true;
 }
 function handleRemote(data){
   setCS('on');
-  if(firstEv){
-    firstEv=false;
-    if(!data||!data.d){pending=true;doPush();return}              // bulut boş → bu cihazı yükle
-    if(onFirst){const f=onFirst;onFirst=null;f(data);return}
+  if(onFirst){const f=onFirst;onFirst=null;f(data);return}
+  if(!data||!data.d){                                   // bulut boş
+    if(state.businesses.length){setPending(true);doPush()}
+    return;
   }
-  if(!data||!data.d)return;
-  const rt=data.t||0,lt=state._t||0;
-  if(rt>lt)applyRemote(data);
-  else if(rt<lt){pending=true;doPush()}                            // çevrimdışı yapılan değişiklikler
+  if(pending){doPush();return}                          // gönderilmemiş yerel değişiklik var → önce onu gönder
+  if(lastT&&data.t===lastT)return;                      // zaten bu sürümdeyiz (kendi gönderdiğimizin yankısı)
+  applyRemote(data);
+}
+async function pullOnce(){
+  if(!cloud)return;
+  try{const r=await fetch(cloudUrl(cloud),{cache:'no-store'});if(!r.ok)throw new Error(r.status);handleRemote(await r.json())}
+  catch(e){setCS('err')}
 }
 function startCloud(c){
-  stopCloud(true);cloud=c;firstEv=true;setCS('wait');
-  try{es=new EventSource(cloudUrl(c))}catch(e){setCS('err');return}
-  const on=async ev=>{
-    let m;try{m=JSON.parse(ev.data)}catch(_){return}
-    if(!m)return;
-    if(m.path==='/')return handleRemote(m.data);
-    try{const r=await fetch(cloudUrl(c));handleRemote(await r.json())}catch(e){setCS('err')}
-  };
-  es.addEventListener('put',on);es.addEventListener('patch',on);
-  es.addEventListener('cancel',()=>{setCS('err');toast('Firebase erişimi reddetti, kuralları kontrol et')});
-  es.onerror=()=>{if(cloud)setCS(es&&es.readyState===2?'err':'wait')};
+  stopCloud(true);cloud=c;setCS('wait');
+  try{es=new EventSource(cloudUrl(c))}catch(e){es=null}
+  if(es){
+    const on=ev=>{
+      let m;try{m=JSON.parse(ev.data)}catch(_){return}
+      if(!m)return;
+      if(m.path==='/')handleRemote(m.data);else pullOnce();
+    };
+    es.addEventListener('put',on);es.addEventListener('patch',on);
+    es.addEventListener('cancel',()=>{setCS('err');toast('Firebase erişimi reddetti, kuralları kontrol et')});
+    es.onopen=()=>setCS('on');
+    es.onerror=()=>{if(cloud&&es&&es.readyState===2)setCS('err')};
+  }
+  // güvenlik ağı: canlı bağlantı sessizce koparsa diye 15 sn'de bir kontrol
+  clearInterval(pollT);
+  pollT=setInterval(()=>{
+    if(!cloud||document.hidden)return;
+    if(pending){doPush();return}
+    if(!es||es.readyState!==1)startCloud(cloud);else pullOnce();
+  },15000);
+  if(pending)doPush();
 }
-function stopCloud(keep){if(es){es.close();es=null}clearTimeout(pushT);if(!keep){cloud=null;setCS('off')}}
+function stopCloud(keep){if(es){es.close();es=null}clearTimeout(pushT);clearInterval(pollT);if(!keep){cloud=null;setCS('off')}}
 async function cloudConnect(){
   let v=document.getElementById('syncIn').value.trim().replace(/\s+/g,'');
   if(!v)return toast('Firebase adresini yapıştır');
   let [url,code]=v.split('#');url=url.replace(/\/+$/,'');
   if(!/^https:\/\/[\w.-]+\.(firebaseio\.com|firebasedatabase\.app)$/i.test(url)&&!/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(url))
-    return toast('Adres geçersiz: …firebasedatabase.app ile bitmeli');
+    return toast('Adres geçersiz: …firebaseio.com ile bitmeli');
   const isNew=!code;
   if(isNew){const a=new Uint8Array(18);crypto.getRandomValues(a);code=[...a].map(x=>x.toString(36).padStart(2,'0')).join('').slice(0,32)}
   if(code.length<24)return toast('Bağlantı kodu eksik görünüyor');
   const c={url,code};
   document.getElementById('syncGo').disabled=true;setCS('wait');
   let remote;
-  try{const r=await fetch(cloudUrl(c));if(r.status===401||r.status===403)throw new Error('rules');if(!r.ok)throw new Error('net');remote=await r.json()}
+  try{const r=await fetch(cloudUrl(c),{cache:'no-store'});if(r.status===401||r.status===403)throw new Error('rules');if(!r.ok)throw new Error('net');remote=await r.json()}
   catch(e){document.getElementById('syncGo').disabled=false;setCS('off');
     return toast(e.message==='rules'?'Firebase izin vermedi: kuralları yapıştırıp Yayınla’ya bastın mı?':'Firebase’e ulaşılamadı, adresi kontrol et')}
   document.getElementById('syncGo').disabled=false;
   const go=()=>{try{localStorage.setItem(SKEY,JSON.stringify(c))}catch(e){}startCloud(c);renderSync();toast('Senkron açıldı')};
   if(remote&&remote.d){
-    const hasLocal=state.businesses.length>0;
-    const take=()=>{onFirst=null;applyRemote(remote,true);go()};
-    if(hasLocal)ask('Buluttaki veriler bu cihaza yüklenecek, bu cihazdaki mevcut veriler değiştirilecek. Devam edilsin mi?',take,'Buluttakini kullan');
+    const take=()=>{setPending(false);applyRemote(remote);go()};
+    if(state.businesses.length)ask('Buluttaki veriler bu cihaza yüklenecek, bu cihazdaki mevcut veriler değiştirilecek. Devam edilsin mi?',take,'Buluttakini kullan');
     else take();
   }else{
-    if(!isNew&&!confirmEmpty(c))return;
-    go();
+    setLastT(null);setPending(state.businesses.length>0);go();
   }
 }
-function confirmEmpty(){return true}
 function cloudDisconnect(){
   ask('Bu cihazda senkron kapatılsın mı? Veriler bu cihazda kalır, buluttakiler silinmez.',()=>{
-    try{localStorage.removeItem(SKEY)}catch(e){}stopCloud();renderSync();toast('Senkron kapatıldı')},'Kapat');
+    try{localStorage.removeItem(SKEY)}catch(e){}setPending(false);setLastT(null);stopCloud();renderSync();toast('Senkron kapatıldı')},'Kapat');
 }
 function renderSync(){
   const m=document.querySelector('#mSync .modal'),c=cloudCfg();
@@ -884,10 +911,12 @@ function copyTxt(t,msg){
   if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(ok,()=>fb());else fb();
   function fb(){const x=document.createElement('textarea');x.value=t;x.style.position='fixed';x.style.opacity='0';document.body.appendChild(x);x.select();try{document.execCommand('copy');ok()}catch(e){toast('Kopyalanamadı, elle seç')}x.remove()}
 }
-// arka plandan dönünce / internet gelince yeniden bağlan
-document.addEventListener('visibilitychange',()=>{if(document.hidden||!cloud)return;if(!es||es.readyState===2)startCloud(cloud);else if(pending)doPush()});
-addEventListener('online',()=>{if(!cloud)return;if(!es||es.readyState===2)startCloud(cloud);if(pending)doPush()});
-addEventListener('pagehide',()=>{if(cloud&&pending){try{fetch(cloudUrl(cloud),{method:'PUT',keepalive:true,body:JSON.stringify({t:state._t,d:JSON.stringify(state)})})}catch(e){}}});
+// uygulamaya geri dönünce / internet gelince bağlantıyı tazele (telefonda arka planda kopar)
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&cloud)startCloud(cloud)});
+addEventListener('pageshow',e=>{if(e.persisted&&cloud)startCloud(cloud)});
+addEventListener('focus',()=>{if(cloud&&(!es||es.readyState!==1))startCloud(cloud)});
+addEventListener('online',()=>{if(cloud)startCloud(cloud)});
+addEventListener('pagehide',()=>{if(cloud&&pending){try{fetch(cloudUrl(cloud),{method:'PUT',keepalive:true,body:bodyOf()})}catch(e){}}});
 
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),2000)}
 
